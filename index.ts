@@ -2,91 +2,98 @@ import { spawnSync } from "bun";
 import fs from "fs";
 import path from "path";
 
-// --- PRE-FLIGHT CHECKS ---
-function checkDependencies() {
+// --- INTERFACES ---
+
+interface TidalTrack {
+  id: number;
+  title: string;
+  duration: number;
+  bpm: number | null;
+  key: string | null;
+  keyScale: "MAJOR" | "MINOR" | null;
+  audioQuality: string;
+  album: {
+    id: number;
+    title: string;
+    cover: string; // UUID okładki
+  };
+}
+
+interface YTTrack {
+  title: string;
+  author: string;
+  duration: number;
+  url: string;
+  thumbnail: string;
+}
+
+// --- PRE-FLIGHT ---
+function checkDependencies(): void {
   const tools = [
-    { name: "yt-dlp", flag: "--version" },
-    { name: "ffmpeg", flag: "-version" },
+    { n: "yt-dlp", f: "--version" },
+    { n: "ffmpeg", f: "-version" },
   ];
-  for (const tool of tools) {
-    const check = spawnSync([tool.name, tool.flag], {
-      stdio: ["ignore", "ignore", "ignore"],
-    });
-    if (check.exitCode !== 0) {
-      console.error(`\n❌ ERROR: "${tool.name}" is not installed.`);
+  for (const t of tools) {
+    if (
+      spawnSync([t.n, t.f], { stdio: ["ignore", "ignore", "ignore"] })
+        .exitCode !== 0
+    ) {
+      console.error(`❌ Missing: ${t.n}`);
       process.exit(1);
     }
   }
 }
-
 checkDependencies();
 
-// --- CONFIGURATION ---
-const INSTANCES = ["https://ohio-1.monochrome.tf", "https://monochrome.tf"];
-
-let deadInstances = new Set<string>();
-
-const args = process.argv.slice(2);
-const isExtended = args.includes("-e");
-const filteredArgs = args.filter((a) => a !== "-e");
-
-const SOURCE_URL = filteredArgs[0];
-const DOWNLOAD_DIR = filteredArgs[1]
-  ? path.resolve(filteredArgs[1])
-  : process.cwd();
-
-if (!SOURCE_URL) {
-  console.error("Usage: bun run index.ts <youtube_url> [folder] [-e]");
-  process.exit(1);
-}
-
-if (!fs.existsSync(DOWNLOAD_DIR))
-  fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
-
 // --- HELPERS ---
-const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
-function shuffle<T>(array: T[]): T[] {
-  const newArr = [...array];
-  for (let i = newArr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [newArr[i], newArr[j]] = [newArr[j], newArr[i]];
-  }
-  return newArr;
+/**
+ * Konwertuje UUID okładki Tidala na pełny URL
+ * Format: https://resources.tidal.com/images/{part1}/{part2}/{part3}/{part4}/{part5}/1280x1280.jpg
+ */
+function getTidalCoverUrl(uuid: string): string | null {
+  if (!uuid || uuid.length < 32) return null;
+  const parts = uuid.split("-");
+  if (parts.length !== 5)
+    return `https://resources.tidal.com/images/${uuid.replace(/-/g, "/")}/1280x1280.jpg`; // fallback
+  return `https://resources.tidal.com/images/${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}/${parts[4]}/1280x1280.jpg`;
 }
 
-function sanitize(name: string): string {
-  return name
-    .replace(/[<>:"/\\|?*]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function applyMetadata(filePath: string, track: any, thumbnailUrl: string) {
+function applyMetadata(
+  filePath: string,
+  track: YTTrack,
+  coverUrl: string,
+): void {
   const ext = path.extname(filePath);
   const tempPath = filePath.replace(ext, `.temp${ext}`);
+
   const ffmpegArgs = [
     "-y",
     "-i",
     filePath,
     "-i",
-    thumbnailUrl,
+    coverUrl,
     "-map",
     "0:0",
     "-map",
     "1:0",
+    "-c:a",
+    "copy",
+    "-c:v",
+    "mjpeg",
+    "-pix_fmt",
+    "yuvj420p",
     "-metadata",
     `title=${track.title}`,
     "-metadata",
     `artist=${track.author}`,
     "-metadata",
-    `comment=Lossless via Gemini`,
+    `comment=From tidal`,
     "-disposition:v",
     "attached_pic",
-    "-c",
-    "copy",
     tempPath,
   ];
+
   const res = spawnSync(["ffmpeg", ...ffmpegArgs], {
     stdio: ["ignore", "ignore", "ignore"],
   });
@@ -94,158 +101,121 @@ function applyMetadata(filePath: string, track: any, thumbnailUrl: string) {
   else if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
 }
 
-function getMetadata(url: string) {
-  console.log("⏳ Fetching metadata...");
-  const proc = spawnSync(
-    [
-      "yt-dlp",
-      "--flat-playlist",
-      "--print",
-      "%(title)s|%(uploader)s|%(duration)s|%(webpage_url)s|%(thumbnail)s",
-      url,
-    ],
-    { stdio: ["pipe", "pipe", "inherit"] },
-  );
-  const output = proc.stdout.toString().trim();
-  if (!output) return [];
-  return output.split("\n").map((line) => {
-    const [title, author, duration, webpage_url, thumb] = line.split("|");
-    return {
-      title,
-      author,
-      duration: parseInt(duration) || 0,
-      url: webpage_url,
-      thumbnail: thumb,
-    };
-  });
+// --- MAIN LOGIC ---
+
+const args = process.argv.slice(2);
+const isExtended = args.includes("-e");
+const filteredArgs = args.filter((a) => a !== "-e");
+const SOURCE_URL = filteredArgs[0];
+const DOWNLOAD_DIR = filteredArgs[1]
+  ? path.resolve(filteredArgs[1])
+  : process.cwd();
+
+if (!SOURCE_URL) {
+  console.error("Usage: bun run index.ts <url> [folder] [-e]");
+  process.exit(1);
 }
+if (!fs.existsSync(DOWNLOAD_DIR))
+  fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
-async function downloadWithFailover(
-  track: any,
-): Promise<{ success: boolean; fatal: boolean }> {
+async function downloadWithFailover(track: YTTrack) {
   const query = `${track.title} ${track.author}`.replace(/[()]/g, "");
-  let available = shuffle(INSTANCES.filter((inst) => !deadInstances.has(inst)));
+  const instances = [
+    "https://ohio-1.monochrome.tf",
+    "https://hifi-two.spotisaver.net",
+    "https://singapore-1.monochrome.tf",
+    "https://hfapi.aluratech.org",
+    "https://eu-central.monochrome.tf",
+    "https://katze.qqdl.site",
+    "https://api.monochrome.tf",
+  ];
 
-  if (available.length === 0) return { success: false, fatal: true };
-
-  for (const baseUrl of available) {
+  for (const baseUrl of instances) {
     try {
       console.log(`🔍 [${baseUrl}] Searching...`);
       const searchRes = await fetch(
         `${baseUrl}/search?s=${encodeURIComponent(query)}`,
-        { signal: AbortSignal.timeout(10000) },
       );
       const searchData = await searchRes.json();
-
-      const items = searchData.data?.items || [];
-      const matched = items.find(
-        (item: any) => Math.abs(item.duration - track.duration) <= 5,
+      const matched = (searchData.data?.items as TidalTrack[])?.find(
+        (i) => Math.abs(i.duration - track.duration) <= 5,
       );
 
       if (!matched) continue;
 
       const streamRes = await fetch(
         `${baseUrl}/track?id=${matched.id}&quality=LOSSLESS`,
-        { signal: AbortSignal.timeout(15000) },
       );
       const streamData = await streamRes.json();
-      const data = streamData.data || streamData;
+      const manifestBase64 = streamData.data?.manifest || streamData.manifest;
+      if (!manifestBase64) continue;
 
-      if (!data.manifest) continue;
       const manifest = JSON.parse(
-        Buffer.from(data.manifest, "base64").toString(),
+        Buffer.from(manifestBase64, "base64").toString(),
       );
       const audioUrl = manifest?.urls?.[0];
 
       if (audioUrl) {
         const ext = audioUrl.toLowerCase().includes(".flac") ? "flac" : "m4a";
-
-        let fileName = sanitize(`${track.author} - ${track.title}`);
-
-        // NOWA LOGIKA ROZSZERZONEJ NAZWY
+        let fileName = track.author + " - " + track.title;
         if (isExtended) {
-          const bpm = matched.bpm || "0";
-          const key = matched.key || "Unknown";
-          const scale = matched.keyScale || "";
-          const quality = matched.audioQuality || "LOSSLESS";
-
-          // Format: [100 BPM] [D MINOR] [LOSSLESS]
-          fileName += ` [${bpm} BPM] [${key} ${scale}] [${quality}]`;
+          fileName += ` [${matched.bpm || 0} BPM] [${matched.key || "?"}${matched.keyScale === "MINOR" ? "m" : ""}] [${matched.audioQuality}]`;
         }
 
-        const filePath = path.join(DOWNLOAD_DIR, `${fileName}.${ext}`);
+        const filePath = path.join(
+          DOWNLOAD_DIR,
+          sanitize(fileName) + "." + ext,
+        );
+        console.log(`📥 Downloading: ${path.basename(filePath)}`);
 
-        console.log(`📥 Downloading: ${fileName}.${ext}`);
         const fileRes = await fetch(audioUrl);
-        const buffer = await fileRes.arrayBuffer();
-        await Bun.write(filePath, buffer);
+        await Bun.write(filePath, await fileRes.arrayBuffer());
 
-        console.log(`🏷️  Applying tags...`);
-        applyMetadata(filePath, track, track.thumbnail);
+        // WYBÓR OKŁADKI: Tidal (High Res) -> YT
+        const tidalCover = matched.album?.cover
+          ? getTidalCoverUrl(matched.album.cover)
+          : null;
+        const finalCover = tidalCover || track.thumbnail;
+
+        console.log(
+          `🏷️  Applying ${tidalCover ? "Tidal" : "YouTube"} Cover...`,
+        );
+        applyMetadata(filePath, track, finalCover);
 
         console.log(`✅ Success!`);
-        return { success: true, fatal: false };
+        return true;
       }
-    } catch (e: any) {
-      console.error(`❌ Instance Error: ${e.message}`);
-      deadInstances.add(baseUrl);
+    } catch (e) {
+      console.error(`❌ Error on ${baseUrl}`);
     }
   }
-  return { success: false, fatal: false };
+  return false;
 }
 
-async function main() {
-  const allTracks = getMetadata(SOURCE_URL);
-  if (allTracks.length === 0) return;
+// --- RUN ---
+console.log("⏳ Fetching metadata...");
+const proc = spawnSync([
+  "yt-dlp",
+  "--flat-playlist",
+  "--print",
+  "%(title)s|%(uploader)s|%(duration)s|%(webpage_url)s|%(thumbnail)s",
+  SOURCE_URL,
+]);
+const tracks: YTTrack[] = proc.stdout
+  .toString()
+  .trim()
+  .split("\n")
+  .map((line) => {
+    const [title, author, duration, url, thumbnail] = line.split("|");
+    return { title, author, duration: parseInt(duration), url, thumbnail };
+  });
 
-  console.log(
-    `📋 Queue: ${allTracks.length} tracks. Extended: ${isExtended ? "ON" : "OFF"}`,
-  );
-  const failedTracks: any[] = [];
-
-  for (let i = 0; i < allTracks.length; i++) {
-    const track = allTracks[i];
-    console.log(`\n🎵 [${i + 1}/${allTracks.length}] ${track.title}`);
-    const result = await downloadWithFailover(track);
-
-    if (!result.success) {
-      failedTracks.push(track);
-      if (result.fatal) break;
-    }
-    await sleep(800);
-  }
-
-  if (failedTracks.length > 0) {
-    const answer = prompt(
-      `\n⚠️ ${failedTracks.length} tracks failed. YT Fallback? (y/n): `,
-    );
-    if (answer?.toLowerCase() === "y") {
-      for (const t of failedTracks) {
-        spawnSync(
-          [
-            "yt-dlp",
-            "-x",
-            "--audio-format",
-            "m4a",
-            "--add-metadata",
-            "--embed-thumbnail",
-            "-o",
-            `${DOWNLOAD_DIR}/%(uploader)s - %(title)s [YT].%(ext)s`,
-            t.url,
-          ],
-          {
-            stdio: ["inherit", "inherit", "inherit"],
-          },
-        );
-      }
-    }
-  }
-
-  console.log("\n✨ Done.");
-  process.exit(0);
+for (let i = 0; i < tracks.length; i++) {
+  console.log(`\n🎵 [${i + 1}/${tracks.length}] ${tracks[i].title}`);
+  await downloadWithFailover(tracks[i]);
+  await new Promise((r) => setTimeout(r, 1000));
 }
 
-main().catch((err) => {
-  console.error("💥 Global Crash:", err);
-  process.exit(1);
-});
+function sanitize(s: string) {
+  return s.replace(/[<>:"/\\|?*]/g, "").trim();
+}
